@@ -8,7 +8,16 @@ from pathlib import Path
 import sys
 import os
 
-ROOT = Path(__file__).resolve().parent
+import sys
+from pathlib import Path
+
+if getattr(sys, "frozen", False):
+    # Running from a PyInstaller EXE
+    ROOT = Path(sys.executable).resolve().parent
+else:
+    # Running from source (python quickplot.py)
+    ROOT = Path(__file__).resolve().parent
+
 DATA_DIR = (ROOT / "data").resolve()
 
 # Discover .h5 files in ./data (sorted for stable prev/next)
