@@ -1,0 +1,43 @@
+name: Build Windows EXE
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build exe
+        run: |
+          pyinstaller --noconsole --onefile app.py --name EDM_SignalViewer
+
+      - name: Package with data
+        run: |
+          mkdir bundle
+          copy dist\EDM_SignalViewer.exe bundle\
+          xcopy data bundle\data /E /I
+          powershell Compress-Archive -Path bundle\* -DestinationPath EDM_SignalViewer_Windows.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EDM_SignalViewer_Windows
+          path: EDM_SignalViewer_Windows.zip

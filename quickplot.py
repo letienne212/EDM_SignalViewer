@@ -90,7 +90,7 @@ def main():
 
     vbox.addLayout(top)
 
-    readout = QtWidgets.QLabel("t: — ms | V: — | I: — | AE: —")
+    readout = QtWidgets.QLabel("t: — sec | V: — | I: — | AE: —")
     readout.setStyleSheet("color: white;")
     readout.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
     vbox.addWidget(readout)
@@ -197,7 +197,7 @@ def main():
         if AE is not None:
             p3 = glw.addPlot(row=2, col=0)
             p3.setLabel("left", "AE (V)")
-            p3.setLabel("bottom", "Time (ms)")
+            p3.setLabel("bottom", "Time (sec)")
             p3.showGrid(x=True, y=True, alpha=0.25)
             c3 = p3.plot(
                 t, AE,
@@ -209,7 +209,7 @@ def main():
             aemin, aemax = y_range(AE)
             p3.setYRange(aemin, aemax, padding=0)
         else:
-            p2.setLabel("bottom", "Time (ms)")
+            p2.setLabel("bottom", "Time (sec)")
 
         # Link X axes
         p2.setXLink(p1)
@@ -295,7 +295,7 @@ def main():
                 v = float(V_arr[j])
                 i = float(I_arr[j])
                 ae_txt = "—" if AE_arr is None else f"{float(AE_arr[j]):.3g}"
-                readout.setText(f"t: {tm_ms:.3f} ms | V: {v:.3g} | I: {i:.3g} | AE: {ae_txt}")
+                readout.setText(f"t: {tm_ms:.3f} sec | V: {v:.3g} | I: {i:.3g} | AE: {ae_txt}")
             finally:
                 state["cross_updating"] = False
 
@@ -364,7 +364,7 @@ def main():
         else:
             ae_txt = f"{float(AE[idx]):.3g}"
 
-        readout.setText(f"t: {tm_ms:.3f} ms | V: {v:.3g} | I: {i:.3g} | AE: {ae_txt}")
+        readout.setText(f"t: {tm_ms:.3f} sec | V: {v:.3g} | I: {i:.3g} | AE: {ae_txt}")
 
     # Throttle mouse-move updates to reduce CPU
     # mouse_proxy = pg.SignalProxy(glw.scene().sigMouseMoved, rateLimit=60, slot=lambda evt: update_crosshair_from_scene(evt[0]))
@@ -435,7 +435,7 @@ def main():
             if l3 is not None:
                 l3.setPos(x0)
             ae_txt = "—" if AE is None else f"{float(AE[0]):.3g}"
-            readout.setText(f"t: {0.0:.3f} ms | V: {float(V[0]):.3g} | I: {float(I[0]):.3g} | AE: {ae_txt}")
+            readout.setText(f"t: {0.0:.3f} sec | V: {float(V[0]):.3g} | I: {float(I[0]):.3g} | AE: {ae_txt}")
 
     combo.currentIndexChanged.connect(on_combo_changed)
     btn_prev.clicked.connect(on_prev)
