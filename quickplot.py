@@ -25,15 +25,32 @@ H5_FILES = sorted([p for p in DATA_DIR.glob("*.h5")])
 if not H5_FILES:
     raise FileNotFoundError(f"No .h5 files found in: {DATA_DIR}")
 
-def load_first_segment(path):
+
+def get_segment_keys(f):
+    if "segments" not in f:
+        raise KeyError("Missing '/segments' group.")
+    seg_keys = sorted(list(f["segments"].keys()))
+    if not seg_keys:
+        raise ValueError("No segments found under /segments.")
+    return seg_keys
+
+
+def load_segment(path, seg_name=None):
     path = str(path)
     with h5py.File(path, "r") as f:
         # Quick sanity checks (helps detect if you're always loading the same file)
         src = f.attrs.get("source_file", "(missing)")
-        nseg = int(np.array(f.attrs.get("nSegments", 0)).squeeze()) if "nSegments" in f.attrs else 0
+        seg_keys = get_segment_keys(f)
+        nseg_attr = (
+            int(np.array(f.attrs.get("nSegments", 0)).squeeze())
+            if "nSegments" in f.attrs
+            else 0
+        )
+        nseg = nseg_attr if nseg_attr > 0 else len(seg_keys)
 
         # Use a stable ordering (h5py key iteration order can be arbitrary)
-        seg_name = sorted(f["segments"].keys())[0]
+        if seg_name is None or seg_name not in seg_keys:
+            seg_name = seg_keys[0]
         seg = f["segments"][seg_name]
 
         I = seg["current"][:].squeeze()
@@ -47,7 +64,12 @@ def load_first_segment(path):
         # Extra debug so you can confirm two files are truly different
         def stats(x):
             x = np.asarray(x)
-            return float(np.min(x)), float(np.max(x)), float(np.mean(x)), float(np.std(x))
+            return (
+                float(np.min(x)),
+                float(np.max(x)),
+                float(np.mean(x)),
+                float(np.std(x)),
+            )
 
         # Commented out debug prints to reduce noise when switching files
         # print("source_file:", src)
@@ -67,7 +89,8 @@ def load_first_segment(path):
 
     # time axis in seconds (float64)
     t = t0 + np.arange(I.size, dtype=np.float64) / Fs
-    return t, V, I, AE, seg_name, Fs, src, nseg
+    return t, V, I, AE, seg_name, Fs, src, nseg, seg_keys
+
 
 def main():
     app = QtWidgets.QApplication([])
@@ -87,6 +110,8 @@ def main():
     btn_home = QtWidgets.QPushButton("⌂ Home")
     btn_next = QtWidgets.QPushButton("Next ▶")
     combo = QtWidgets.QComboBox()
+    lbl_seg = QtWidgets.QLabel("Seg:")
+    combo_seg = QtWidgets.QComboBox()
 
     # Populate dropdown with filenames
     for p in H5_FILES:
@@ -96,6 +121,8 @@ def main():
     top.addWidget(btn_home)
     top.addWidget(btn_next)
     top.addWidget(combo, 1)
+    top.addWidget(lbl_seg)
+    top.addWidget(combo_seg)
 
     vbox.addLayout(top)
 
@@ -149,12 +176,40 @@ def main():
         state["set_cross_x"] = None
         state["cross_updating"] = False
 
-    def plot_file(p: Path):
+    def populate_segments_for_file(p: Path, prefer_seg=None):
+        path = str(p)
+        try:
+            with h5py.File(path, "r") as f:
+                seg_keys = get_segment_keys(f)
+        except Exception as exc:
+            combo_seg.blockSignals(True)
+            combo_seg.clear()
+            combo_seg.blockSignals(False)
+            QtWidgets.QMessageBox.critical(
+                win, "Segments not found", f"{p.name}\n{exc}"
+            )
+            return None
+
+        selected = prefer_seg if prefer_seg in seg_keys else seg_keys[0]
+        combo_seg.blockSignals(True)
+        combo_seg.clear()
+        combo_seg.addItems(seg_keys)
+        combo_seg.setCurrentIndex(seg_keys.index(selected))
+        combo_seg.blockSignals(False)
+        return selected
+
+    def plot_file(p: Path, seg_name=None):
         # Rebuild plots (clear previous widgets/items first)
         clear_plots()
 
         # Load data
-        t, V, I, AE, seg_name, Fs, src, nseg = load_first_segment(p)
+        try:
+            t, V, I, AE, seg_name, Fs, src, nseg, seg_keys = load_segment(p, seg_name)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                win, "Failed to load segment", f"{p.name}\n{exc}"
+            )
+            return
 
         # Keep arrays in state for crosshair readout
         state["t"] = t
@@ -174,18 +229,23 @@ def main():
             return xmin - pad, xmax + pad
 
         # Title with metadata
-        win.setWindowTitle(f"EDM Signal Viewer — {p.name} | source={src} | seg={seg_name} | Fs={Fs/1e6:.1f} MHz")
+        seg_idx = seg_keys.index(seg_name) if seg_name in seg_keys else 0
+        seg_total = nseg if nseg > 0 else len(seg_keys)
+        win.setWindowTitle(
+            f"EDM Signal Viewer | {p.name} | source={src} | seg={seg_name} ({seg_idx + 1}/{seg_total}) | Fs={Fs/1e6:.1f} MHz"
+        )
 
         p1 = glw.addPlot(row=0, col=0)
         p1.setLabel("left", "Voltage (V)")
         p1.showGrid(x=True, y=True, alpha=0.25)
         c1 = p1.plot(
-            t, V,
+            t,
+            V,
             pen=pg.mkPen(color=(0, 120, 255), width=1.5),
         )  # blue
         # Performance (rendering only): keep full data, but draw efficiently
         c1.setClipToView(True)
-        c1.setDownsampling(auto=True, method='peak')
+        c1.setDownsampling(auto=True, method="peak")
         vmin, vmax = y_range(V)
         p1.setYRange(vmin, vmax, padding=0)
 
@@ -193,12 +253,13 @@ def main():
         p2.setLabel("left", "Current (A)")
         p2.showGrid(x=True, y=True, alpha=0.25)
         c2 = p2.plot(
-            t, I,
+            t,
+            I,
             pen=pg.mkPen(color=(220, 50, 50), width=1.5),
         )  # red
         # Performance (rendering only)
         c2.setClipToView(True)
-        c2.setDownsampling(auto=True, method='peak')
+        c2.setDownsampling(auto=True, method="peak")
         imin, imax = y_range(I)
         p2.setYRange(imin, imax, padding=0)
 
@@ -209,12 +270,13 @@ def main():
             p3.setLabel("bottom", "Time (sec)")
             p3.showGrid(x=True, y=True, alpha=0.25)
             c3 = p3.plot(
-                t, AE,
+                t,
+                AE,
                 pen=pg.mkPen(color=(240, 240, 240), width=1.2),
             )  # white
             # Performance (rendering only)
             c3.setClipToView(True)
-            c3.setDownsampling(auto=True, method='peak')
+            c3.setDownsampling(auto=True, method="peak")
             aemin, aemax = y_range(AE)
             p3.setYRange(aemin, aemax, padding=0)
         else:
@@ -304,7 +366,9 @@ def main():
                 v = float(V_arr[j])
                 i = float(I_arr[j])
                 ae_txt = "—" if AE_arr is None else f"{float(AE_arr[j]):.3g}"
-                readout.setText(f"t: {tm_ms:.3f} sec | V: {v:.3g} | I: {i:.3g} | AE: {ae_txt}")
+                readout.setText(
+                    f"t: {tm_ms:.3f} sec | V: {v:.3g} | I: {i:.3g} | AE: {ae_txt}"
+                )
             finally:
                 state["cross_updating"] = False
 
@@ -393,7 +457,9 @@ def main():
         pt = vb.mapSceneToView(e.scenePos())
         setter(float(pt.x()))
 
-    click_proxy = pg.SignalProxy(glw.scene().sigMouseClicked, rateLimit=60, slot=on_mouse_clicked)
+    click_proxy = pg.SignalProxy(
+        glw.scene().sigMouseClicked, rateLimit=60, slot=on_mouse_clicked
+    )
     state["scene_proxy"] = click_proxy
 
     def select_index(i: int):
@@ -401,6 +467,8 @@ def main():
         combo.setCurrentIndex(i)
 
     def on_combo_changed(i: int):
+        if i < 0 or i >= len(H5_FILES):
+            return
         p = H5_FILES[i]
         # Small console info (useful when debugging)
         try:
@@ -408,7 +476,19 @@ def main():
             print("File size (MB):", p.stat().st_size / 1024 / 1024)
         except Exception:
             pass
-        plot_file(p)
+        selected_seg = populate_segments_for_file(p)
+        if not selected_seg:
+            return
+        plot_file(p, selected_seg)
+
+    def on_seg_changed(i: int):
+        if combo.count() == 0 or combo_seg.count() == 0:
+            return
+        p = H5_FILES[combo.currentIndex()]
+        seg_name = combo_seg.currentText()
+        if not seg_name:
+            return
+        plot_file(p, seg_name)
 
     def on_prev():
         select_index(combo.currentIndex() - 1)
@@ -444,9 +524,12 @@ def main():
             if l3 is not None:
                 l3.setPos(x0)
             ae_txt = "—" if AE is None else f"{float(AE[0]):.3g}"
-            readout.setText(f"t: {0.0:.3f} sec | V: {float(V[0]):.3g} | I: {float(I[0]):.3g} | AE: {ae_txt}")
+            readout.setText(
+                f"t: {0.0:.3f} sec | V: {float(V[0]):.3g} | I: {float(I[0]):.3g} | AE: {ae_txt}"
+            )
 
     combo.currentIndexChanged.connect(on_combo_changed)
+    combo_seg.currentIndexChanged.connect(on_seg_changed)
     btn_prev.clicked.connect(on_prev)
     btn_home.clicked.connect(on_home)
     btn_next.clicked.connect(on_next)
@@ -454,10 +537,10 @@ def main():
     # Load first file explicitly
     if combo.count() > 0:
         combo.setCurrentIndex(0)
-        plot_file(H5_FILES[0])
 
     win.show()
     app.exec()
+
 
 if __name__ == "__main__":
     main()

@@ -2,10 +2,10 @@ import h5py
 import numpy as np
 import os
 
-h5_path = "data.h5"
+h5_path = "data/test.h5"
 
 print("Opening file:", os.path.abspath(h5_path))
-print("File size (MB):", os.path.getsize(h5_path)/1024/1024)
+print("File size (MB):", os.path.getsize(h5_path) / 1024 / 1024)
 
 with h5py.File(h5_path, "r") as f:
     print("\n=== FILE METADATA ===")
