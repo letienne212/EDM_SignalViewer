@@ -1,5 +1,7 @@
 import h5py
 import numpy as np
+import time
+import math
 
 import pyqtgraph as pg
 from PySide6 import QtWidgets, QtCore
@@ -138,8 +140,8 @@ def main():
     win.setCentralWidget(central)
     win.resize(1400, 900)
 
-    # Performance settings
-    pg.setConfigOptions(useOpenGL=True, antialias=False)
+    # Disable OpenGL so LinearRegionItem overlays render reliably.
+    pg.setConfigOptions(useOpenGL=False, antialias=False)
 
     # Hold plot items so we can link/update
     state = {
@@ -159,7 +161,319 @@ def main():
         "cross_updating": False,
     }
 
+    slope_tool = {
+        "active_channel": None,
+        "active_plotitem": None,
+        "plot_by_channel": {},
+        "base_titles": {},
+        "last_titles": {},
+        "region": None,
+        "region_plot": None,
+        "slope": None,
+        "slope_valid": False,
+        "region_signals_connected": False,
+        "press_scene_pos": None,
+        "press_x_data": None,
+        "ctrl_selecting": False,
+        "selecting": False,
+        "last_update_ts": 0.0,
+        "drag_threshold_px": 8,
+        "min_points": 2,
+        "max_fit_points": 5000,
+        "throttle_s": 0.10,
+    }
+
+    def get_channel_data(channel):
+        if channel == "V":
+            return state.get("V")
+        if channel == "I":
+            return state.get("I")
+        if channel == "AE":
+            return state.get("AE")
+        return None
+
+    def set_plot_title(channel, text):
+        plot = slope_tool.get("plot_by_channel", {}).get(channel)
+        if plot is None:
+            return
+        last_titles = slope_tool.get("last_titles", {})
+        if text == last_titles.get(channel, ""):
+            return
+        plot.setTitle(text)
+        last_titles[channel] = text
+        slope_tool["last_titles"] = last_titles
+
+    def refresh_titles(active_only=True):
+        # Cache titles to avoid hammering the UI on every mouse move.
+        plot_by_channel = slope_tool.get("plot_by_channel", {})
+        base_titles = slope_tool.get("base_titles", {})
+        active = slope_tool.get("active_channel")
+        has_region = slope_tool.get("region") is not None
+
+        def build_title(channel):
+            text = base_titles.get(channel, "")
+            if channel == active:
+                text += " (active)"
+                if has_region:
+                    if slope_tool.get("slope_valid", False):
+                        slope_txt = f"{slope_tool['slope']:.6g}"
+                    else:
+                        slope_txt = "—"
+                    text += f" — slope: {slope_tool['slope']:.2f} /μs"
+            return text
+
+        if active_only:
+            if active in plot_by_channel:
+                set_plot_title(active, build_title(active))
+            return
+
+        for channel in base_titles:
+            if channel in plot_by_channel:
+                set_plot_title(channel, build_title(channel))
+
+    def attach_region_to_active_plot():
+        region = slope_tool.get("region")
+        if region is None:
+            return
+        active_plot = slope_tool.get("active_plotitem")
+        if active_plot is None:
+            return
+        if slope_tool.get("region_plot") is active_plot:
+            return
+        bounds = region.getRegion()
+        old_plot = slope_tool.get("region_plot")
+        if old_plot is not None:
+            old_plot.removeItem(region)
+        active_plot.addItem(region, ignoreBounds=True)
+        slope_tool["region_plot"] = active_plot
+        region.setRegion(bounds)
+
+    def update_region_bounds(x0, x1):
+        region = slope_tool.get("region")
+        if region is None:
+            return
+        if x0 > x1:
+            x0, x1 = x1, x0
+        xx0 = state.get("x0")
+        xx1 = state.get("x1")
+        if xx0 is not None and xx1 is not None:
+            x0 = max(xx0, min(xx1, x0))
+            x1 = max(xx0, min(xx1, x1))
+        region.setRegion((x0, x1))
+
+    def recompute_slope(throttled=False):
+        region = slope_tool.get("region")
+        if region is None:
+            slope_tool["slope"] = None
+            slope_tool["slope_valid"] = False
+            refresh_titles(active_only=True)
+            return
+        if throttled:
+            now = time.monotonic()
+            if now - slope_tool.get("last_update_ts", 0.0) < slope_tool.get("throttle_s", 0.10):
+                return
+            slope_tool["last_update_ts"] = now
+
+        t = state.get("t")
+        y = get_channel_data(slope_tool.get("active_channel"))
+        if t is None or y is None:
+            slope_tool["slope"] = None
+            slope_tool["slope_valid"] = False
+            refresh_titles(active_only=True)
+            return
+
+        x0, x1 = region.getRegion()
+        if x0 > x1:
+            x0, x1 = x1, x0
+
+        idx0 = int(np.searchsorted(t, x0, side="left"))
+        idx1 = int(np.searchsorted(t, x1, side="right"))
+        t_sel = t[idx0:idx1]
+        y_sel = y[idx0:idx1]
+
+        min_points = slope_tool.get("min_points", 2)
+        if t_sel.size < min_points:
+            slope_tool["slope"] = None
+            slope_tool["slope_valid"] = False
+            refresh_titles(active_only=True)
+            return
+
+        mask = np.isfinite(t_sel) & np.isfinite(y_sel)
+        if int(mask.sum()) < min_points:
+            slope_tool["slope"] = None
+            slope_tool["slope_valid"] = False
+            refresh_titles(active_only=True)
+            return
+
+        t_sel = t_sel[mask]
+        y_sel = y_sel[mask]
+        max_fit_points = slope_tool.get("max_fit_points", 5000)
+        if t_sel.size > max_fit_points:
+            # Cap polyfit points to keep dragging responsive.
+            step = max(1, t_sel.size // max_fit_points)
+            t_sel = t_sel[::step]
+            y_sel = y_sel[::step]
+        if t_sel.size < min_points:
+            slope_tool["slope"] = None
+            slope_tool["slope_valid"] = False
+            refresh_titles(active_only=True)
+            return
+
+        # Scale time to microseconds so slope is per-us.
+        t_fit = t_sel * 1e6
+        m, _b = np.polyfit(t_fit, y_sel, 1)
+        slope_tool["slope"] = float(m)
+        slope_tool["slope_valid"] = True
+        refresh_titles(active_only=True)
+
+    def on_region_changed():
+        recompute_slope(throttled=True)
+
+    def on_region_change_finished():
+        recompute_slope(throttled=False)
+
+    def ensure_region():
+        if slope_tool.get("region") is not None:
+            return slope_tool["region"]
+        region = pg.LinearRegionItem(
+            values=(0, 0),
+            orientation="vertical",
+            movable=True,
+            brush=pg.mkBrush(0, 150, 255, 60),
+            pen=pg.mkPen((0, 150, 255, 180), width=1),
+        )
+        region.setZValue(5)
+        if not slope_tool.get("region_signals_connected", False):
+            region.sigRegionChanged.connect(on_region_changed)
+            if hasattr(region, "sigRegionChangeFinished"):
+                region.sigRegionChangeFinished.connect(on_region_change_finished)
+            elif hasattr(region, "sigRegionChangedFinished"):
+                region.sigRegionChangedFinished.connect(on_region_change_finished)
+            else:
+                # Fall back to sigRegionChanged-only updates if no finished signal exists.
+                pass
+            slope_tool["region_signals_connected"] = True
+        slope_tool["region"] = region
+        slope_tool["region_plot"] = None
+        attach_region_to_active_plot()
+        refresh_titles(active_only=True)
+        return region
+
+    def set_active_channel(channel):
+        plot_by_channel = slope_tool.get("plot_by_channel", {})
+        if channel not in plot_by_channel:
+            return
+        if (
+            slope_tool.get("active_channel") == channel
+            and slope_tool.get("active_plotitem") is plot_by_channel[channel]
+        ):
+            return
+        # Active plot/channel follows the last click/drag inside a plot.
+        slope_tool["active_channel"] = channel
+        slope_tool["active_plotitem"] = plot_by_channel[channel]
+        attach_region_to_active_plot()
+        refresh_titles(active_only=False)
+        if slope_tool.get("region") is not None:
+            recompute_slope(throttled=False)
+
+    def clear_slope_region():
+        region = slope_tool.get("region")
+        if region is not None:
+            region_plot = slope_tool.get("region_plot")
+            if region_plot is not None:
+                region_plot.removeItem(region)
+        slope_tool["region"] = None
+        slope_tool["region_plot"] = None
+        slope_tool["slope"] = None
+        slope_tool["slope_valid"] = False
+        slope_tool["region_signals_connected"] = False
+        slope_tool["ctrl_selecting"] = False
+        slope_tool["selecting"] = False
+        slope_tool["press_scene_pos"] = None
+        slope_tool["press_x_data"] = None
+        slope_tool["last_update_ts"] = 0.0
+        refresh_titles(active_only=True)
+
+    def get_active_viewbox():
+        active_plot = slope_tool.get("active_plotitem")
+        if active_plot is None:
+            active_plot = state.get("p1")
+        if active_plot is None:
+            return None
+        return active_plot.vb
+
+    class SlopeViewBox(pg.ViewBox):
+        def __init__(self, channel, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.channel = channel
+
+        def mousePressEvent(self, ev):
+            if ev.button() == QtCore.Qt.LeftButton:
+                set_active_channel(self.channel)
+            super().mousePressEvent(ev)
+
+        def mouseClickEvent(self, ev):
+            if ev.button() == QtCore.Qt.LeftButton:
+                set_active_channel(self.channel)
+            super().mouseClickEvent(ev)
+
+        def mouseDragEvent(self, ev):
+            if ev.button() != QtCore.Qt.LeftButton:
+                super().mouseDragEvent(ev)
+                return
+
+            if ev.isStart():
+                set_active_channel(self.channel)
+
+            is_ctrl = bool(ev.modifiers() & QtCore.Qt.ControlModifier)
+            if is_ctrl or slope_tool.get("ctrl_selecting") or slope_tool.get("selecting"):
+                # Ctrl+drag is reserved for the slope tool; accept to prevent panning.
+                ev.accept()
+                if ev.isStart():
+                    if not is_ctrl:
+                        return
+                    slope_tool["press_scene_pos"] = ev.scenePos()
+                    slope_tool["press_x_data"] = float(self.mapSceneToView(ev.scenePos()).x())
+                    slope_tool["ctrl_selecting"] = True
+                    slope_tool["selecting"] = False
+                    return
+
+                if not slope_tool.get("ctrl_selecting"):
+                    return
+
+                if ev.isFinish():
+                    if slope_tool.get("selecting"):
+                        recompute_slope(throttled=False)
+                    slope_tool["ctrl_selecting"] = False
+                    slope_tool["selecting"] = False
+                    slope_tool["press_scene_pos"] = None
+                    slope_tool["press_x_data"] = None
+                    return
+
+                press_pos = slope_tool.get("press_scene_pos")
+                if press_pos is None:
+                    return
+
+                delta = ev.scenePos() - press_pos
+                if not slope_tool.get("selecting"):
+                    # Ctrl+drag gesture: wait until the cursor moves enough to start a region.
+                    if math.hypot(delta.x(), delta.y()) < slope_tool.get("drag_threshold_px", 8):
+                        return
+                    slope_tool["selecting"] = True
+                    ensure_region()
+
+                x0 = slope_tool.get("press_x_data")
+                if x0 is None:
+                    return
+                x1 = float(self.mapSceneToView(ev.scenePos()).x())
+                update_region_bounds(x0, x1)
+                recompute_slope(throttled=True)
+                return
+
+            super().mouseDragEvent(ev)
+
     def clear_plots():
+        clear_slope_region()
         glw.clear()
         state["p1"] = None
         state["p2"] = None
@@ -175,6 +489,11 @@ def main():
         state["cross"] = None
         state["set_cross_x"] = None
         state["cross_updating"] = False
+        slope_tool["plot_by_channel"] = {}
+        slope_tool["base_titles"] = {}
+        slope_tool["last_titles"] = {}
+        slope_tool["active_channel"] = None
+        slope_tool["active_plotitem"] = None
 
     def populate_segments_for_file(p: Path, prefer_seg=None):
         path = str(p)
@@ -235,7 +554,11 @@ def main():
             f"EDM Signal Viewer | {p.name} | source={src} | seg={seg_name} ({seg_idx + 1}/{seg_total}) | Fs={Fs/1e6:.1f} MHz"
         )
 
-        p1 = glw.addPlot(row=0, col=0)
+        vb1 = SlopeViewBox("V")
+        vb2 = SlopeViewBox("I")
+        vb3 = SlopeViewBox("AE") if AE is not None else None
+
+        p1 = glw.addPlot(row=0, col=0, viewBox=vb1)
         p1.setLabel("left", "Voltage (V)")
         p1.showGrid(x=True, y=True, alpha=0.25)
         c1 = p1.plot(
@@ -249,7 +572,7 @@ def main():
         vmin, vmax = y_range(V)
         p1.setYRange(vmin, vmax, padding=0)
 
-        p2 = glw.addPlot(row=1, col=0)
+        p2 = glw.addPlot(row=1, col=0, viewBox=vb2)
         p2.setLabel("left", "Current (A)")
         p2.showGrid(x=True, y=True, alpha=0.25)
         c2 = p2.plot(
@@ -265,9 +588,9 @@ def main():
 
         p3 = None
         if AE is not None:
-            p3 = glw.addPlot(row=2, col=0)
+            p3 = glw.addPlot(row=2, col=0, viewBox=vb3)
             p3.setLabel("left", "AE (V)")
-            p3.setLabel("bottom", "Time (sec)")
+            p3.setLabel("bottom", "Time (ms)")
             p3.showGrid(x=True, y=True, alpha=0.25)
             c3 = p3.plot(
                 t,
@@ -280,12 +603,20 @@ def main():
             aemin, aemax = y_range(AE)
             p3.setYRange(aemin, aemax, padding=0)
         else:
-            p2.setLabel("bottom", "Time (sec)")
+            p2.setLabel("bottom", "Time (ms)")
+
+        if p3 is not None:
+            p1.setLabel("bottom", "Time (ms)")
+            p2.setLabel("bottom", "Time (ms)")
 
         # Link X axes
         p2.setXLink(p1)
         if p3 is not None:
             p3.setXLink(p1)
+
+        plots = [p1, p2] + ([p3] if p3 is not None else [])
+        for p in plots:
+            p.getAxis("bottom").enableAutoSIPrefix(False)
 
         # X-only zoom
         p1.setMouseEnabled(x=True, y=False)
@@ -305,6 +636,13 @@ def main():
         state["p1"] = p1
         state["p2"] = p2
         state["p3"] = p3
+        slope_tool["plot_by_channel"] = {"V": p1, "I": p2}
+        slope_tool["base_titles"] = {"V": "Voltage", "I": "Current"}
+        if p3 is not None:
+            slope_tool["plot_by_channel"]["AE"] = p3
+            slope_tool["base_titles"]["AE"] = "AE"
+        slope_tool["last_titles"] = {key: "" for key in slope_tool["base_titles"]}
+        set_active_channel("V")
 
         # Shared vertical crosshair (click to place + drag to move)
         cross_pen = pg.mkPen(color=(255, 255, 0), width=1)  # yellow, high contrast
@@ -399,8 +737,10 @@ def main():
         if t is None or V is None or I is None or cross is None:
             return
 
-        # Map scene position to data coordinates using the top plot's ViewBox
-        vb = p1.vb
+        # Map scene position to data coordinates using the active plot's ViewBox
+        vb = get_active_viewbox()
+        if vb is None:
+            return
         mouse_point = vb.mapSceneToView(pos)
         x = float(mouse_point.x())
 
@@ -447,13 +787,17 @@ def main():
         e = evt[0]
         if hasattr(e, "button") and e.button() != QtCore.Qt.LeftButton:
             return
-
-        setter = state.get("set_cross_x")
-        p1 = state.get("p1")
-        if setter is None or p1 is None:
+        if e.modifiers() & QtCore.Qt.ControlModifier:
+            # Ctrl+click is reserved for the slope tool; keep crosshair unchanged.
             return
 
-        vb = p1.vb
+        setter = state.get("set_cross_x")
+        if setter is None:
+            return
+
+        vb = get_active_viewbox()
+        if vb is None:
+            return
         pt = vb.mapSceneToView(e.scenePos())
         setter(float(pt.x()))
 
@@ -461,6 +805,15 @@ def main():
         glw.scene().sigMouseClicked, rateLimit=60, slot=on_mouse_clicked
     )
     state["scene_proxy"] = click_proxy
+
+    def on_key_press(event):
+        if event.key() == QtCore.Qt.Key_Escape:
+            clear_slope_region()
+            event.accept()
+            return
+        QtWidgets.QMainWindow.keyPressEvent(win, event)
+
+    win.keyPressEvent = on_key_press
 
     def select_index(i: int):
         i = max(0, min(i, combo.count() - 1))
@@ -534,9 +887,9 @@ def main():
     btn_home.clicked.connect(on_home)
     btn_next.clicked.connect(on_next)
 
-    # Load first file explicitly
+    # Load first file explicitly after signals are connected.
     if combo.count() > 0:
-        combo.setCurrentIndex(0)
+        on_combo_changed(combo.currentIndex())
 
     win.show()
     app.exec()
